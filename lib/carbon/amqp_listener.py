@@ -81,6 +81,7 @@ class AMQPProtocol(CarbonServerProtocol):
         amqp_vhost = settings.AMQP_VHOST
         amqp_spec = settings.AMQP_SPEC
         amqp_exchange_name = settings.AMQP_EXCHANGE
+        amqp_queue_name = settings.AMQP_QUEUE
 
         factory = createAMQPListener(
             amqp_user,
@@ -88,6 +89,7 @@ class AMQPProtocol(CarbonServerProtocol):
             vhost=amqp_vhost,
             spec=amqp_spec,
             exchange_name=amqp_exchange_name,
+            queue_name=amqp_queue_name,
             verbose=amqp_verbose)
         service = TCPClient(amqp_host, amqp_port, factory)
         service.setServiceParent(root_service)
@@ -108,41 +110,42 @@ class AMQPGraphiteProtocol(AMQClient):
     @inlineCallbacks
     def setup(self):
         exchange = self.factory.exchange_name
+        queue_name = self.factory.queue_name
 
         yield self.authenticate(self.factory.username, self.factory.password)
         chan = yield self.channel(1)
         yield chan.channel_open()
 
         # declare the exchange and queue
-        yield chan.exchange_declare(exchange=exchange, type="topic",
+        yield chan.exchange_declare(exchange=exchange, type="direct",
                                     durable=True, auto_delete=False)
 
-        # we use a private queue to avoid conflicting with existing bindings
-        reply = yield chan.queue_declare(exclusive=True)
+        reply = yield chan.queue_declare(
+            queue=queue_name,
+            exclusive=False,
+            durable=True,
+            auto_delete=False)
+
         my_queue = reply.queue
 
-        # bind each configured metric pattern
-        for bind_pattern in settings.BIND_PATTERNS:
-            log.listener("binding exchange '%s' to queue '%s' with pattern %s"
-                         % (exchange, my_queue, bind_pattern))
-            yield chan.queue_bind(exchange=exchange, queue=my_queue,
-                                  routing_key=bind_pattern)
+        yield chan.queue_bind(exchange=exchange, queue=my_queue,
+                              routing_key=queue_name)
 
-        yield chan.basic_consume(queue=my_queue, no_ack=True,
-                                 consumer_tag=self.consumer_tag)
+        yield chan.basic_consume(queue=my_queue, no_ack=True, consumer_tag="%s_%s" % (self.consumer_tag, queue_name))
 
     @inlineCallbacks
     def receive_loop(self):
-        queue = yield self.queue(self.consumer_tag)
+        queue = yield self.queue("%s_%s" % (self.consumer_tag, self.factory.queue_name))
 
         while True:
             msg = yield queue.get()
+            log.listener("Got msg: %s" % msg)
             self.processMessage(msg)
 
     def processMessage(self, message):
         """Parse a message and post it as a metric."""
 
-        if self.factory.verbose:
+        if True or self.factory.verbose:
             log.listener("Message received: %s" % (message,))
 
         metric = message.routing_key
@@ -179,7 +182,7 @@ class AMQPReconnectingFactory(ReconnectingClientFactory):
     protocol = AMQPGraphiteProtocol
 
     def __init__(self, username, password, delegate, vhost, spec, channel,
-                 exchange_name, verbose):
+                 exchange_name, queue_name, verbose):
         self.username = username
         self.password = password
         self.delegate = delegate
@@ -187,6 +190,7 @@ class AMQPReconnectingFactory(ReconnectingClientFactory):
         self.spec = spec
         self.channel = channel
         self.exchange_name = exchange_name
+        self.queue_name = queue_name
         self.verbose = verbose
 
     def buildProtocol(self, addr):
@@ -196,7 +200,7 @@ class AMQPReconnectingFactory(ReconnectingClientFactory):
         return p
 
 
-def createAMQPListener(username, password, vhost, exchange_name,
+def createAMQPListener(username, password, vhost, exchange_name, queue_name,
                        spec=None, channel=1, verbose=False):
     """
     Create an C{AMQPReconnectingFactory} configured with the specified options.
@@ -208,18 +212,18 @@ def createAMQPListener(username, password, vhost, exchange_name,
 
     delegate = TwistedDelegate()
     factory = AMQPReconnectingFactory(username, password, delegate, vhost,
-                                      spec, channel, exchange_name,
+                                      spec, channel, exchange_name, queue_name,
                                       verbose=verbose)
     return factory
 
 
-def startReceiver(host, port, username, password, vhost, exchange_name,
+def startReceiver(host, port, username, password, vhost, exchange_name, queue_name,
                   spec=None, channel=1, verbose=False):
     """
     Starts a twisted process that will read messages on the amqp broker and
     post them as metrics.
     """
-    factory = createAMQPListener(username, password, vhost, exchange_name,
+    factory = createAMQPListener(username, password, vhost, exchange_name, queue_name,
                                  spec=spec, channel=channel, verbose=verbose)
     reactor.connectTCP(host, port, factory)
 
@@ -249,6 +253,10 @@ def main():
                       help="exchange", metavar="EXCHANGE",
                       default="graphite")
 
+    parser.add_option("-q", "--queue", dest="queue",
+                      help="queue name", metavar="QUEUE",
+                      default="graphite")
+
     parser.add_option("-v", "--verbose", dest="verbose",
                       help="verbose",
                       default=False, action="store_true")
@@ -257,7 +265,9 @@ def main():
 
     startReceiver(options.host, options.port, options.username,
                   options.password, vhost=options.vhost,
-                  exchange_name=options.exchange, verbose=options.verbose)
+                  exchange_name=options.exchange,
+                  queue_namne=options.queue_name,
+                  verbose=options.verbose)
     reactor.run()
 
 
